@@ -16,6 +16,10 @@
   先按 /audit-lock 规则校验 current_lock；无效返回 409 审计问题，
   有效则按锁定版本与目标环境已激活依赖建图，返回根包到目标包的
   全部最短包路径（菱形保留等长路径，环安全、确定性排序）
+* POST /sbom        先按 /audit-lock 规则校验 current_lock；无效返回 409
+  审计问题，有效则沿已激活依赖图导出确定性 SBOM 清单（按包名排序，
+  每包含规范化名、版本、PURL、依赖名称与快照元数据；元数据缺失只产生
+  warnings，不阻断导出）
 * GET  /healthz     健康检查
 """
 
@@ -35,6 +39,7 @@ from .repository import (
     parse_root_specifier,
 )
 from .resolver import ResolutionLimit, Resolver
+from .sbom import build_sbom
 from .schemas import (
     AuditLockRequest,
     AuditLockResponse,
@@ -47,6 +52,8 @@ from .schemas import (
     MatrixUnresolvedResponse,
     ResolveRequest,
     ResolveResponse,
+    SbomRequest,
+    SbomResponse,
     UnresolvedResponse,
     UpgradeRequest,
     UpgradeResponse,
@@ -59,7 +66,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -510,4 +517,66 @@ def dependency_paths_endpoint(request: DependencyPathsRequest):
         "target": target_canonical,
         "reachable": bool(paths),
         "paths": paths,
+    }
+
+
+@app.post(
+    "/sbom",
+    summary="在有效锁定清单上导出确定性 SBOM 清单",
+    response_model=SbomResponse,
+    responses={
+        409: {"model": InvalidLockResponse, "description": "锁定清单未通过审计"},
+        422: {"model": InvalidSnapshotResponse, "description": "快照或 current_lock 非法"},
+    },
+)
+def sbom_endpoint(request: SbomRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        current_lock = parse_current_lock(payload["current_lock"])
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 先按现有审计规则校验锁定清单；无效则带确定性排序的问题返回 409，
+    # 不执行任何导出。
+    result = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=current_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    if not result["valid"]:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "invalid_lock",
+                "message": "锁定清单未通过审计，未导出 SBOM",
+                "issues": result["issues"],
+            },
+        )
+
+    # 有效锁：沿已激活依赖图导出清单；元数据缺失只进入 warnings。
+    sbom = build_sbom(repo, root_name=root_canonical, current_lock=current_lock)
+    return {
+        "status": "ok",
+        "root": root_canonical,
+        "root_version": str(current_lock[root_canonical]),
+        **sbom,
     }

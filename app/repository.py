@@ -52,11 +52,32 @@ class Dependency:
 
 
 class Candidate:
-    __slots__ = ("version", "deps")
+    __slots__ = ("version", "deps", "source_url", "sha256", "license")
 
-    def __init__(self, version: Version, deps: list[Dependency]):
+    def __init__(
+        self,
+        version: Version,
+        deps: list[Dependency],
+        *,
+        source_url: str | None = None,
+        sha256: str | None = None,
+        license: str | None = None,
+    ):
         self.version = version
         self.deps = deps
+        # 可选元数据（/sbom 导出用）：缺失为 None，不参与求解与审计。
+        self.source_url = source_url
+        self.sha256 = sha256
+        self.license = license
+
+    @property
+    def metadata(self) -> dict[str, str | None]:
+        """候选版本携带的全部元数据字段（缺失为 None）。"""
+        return {
+            "source_url": self.source_url,
+            "sha256": self.sha256,
+            "license": self.license,
+        }
 
 
 class Repository:
@@ -80,6 +101,30 @@ def _parse_specifier(raw: str, *, owner: str) -> SpecifierSet:
         raise SnapshotError(f"包 {owner!r} 的版本约束 {raw!r} 不是合法的 PEP 440 约束: {exc}") from exc
 
 
+#: 候选版本可携带的可选元数据字段（/sbom 导出；缺失只产生 warning）。
+METADATA_FIELDS = ("source_url", "sha256", "license")
+
+
+def _parse_metadata(item: dict, *, owner: str) -> dict[str, str | None]:
+    """读取候选版本的可选元数据（source_url / sha256 / license）。
+
+    空白字符串视为缺失（None）；非字符串值抛 SnapshotError（API 层映射
+    为 422）。元数据只随快照传递，不影响求解、审计与 marker 求值。
+    """
+    meta: dict[str, str | None] = {}
+    for field_name in METADATA_FIELDS:
+        raw = item.get(field_name)
+        if raw is None:
+            meta[field_name] = None
+            continue
+        if not isinstance(raw, str):
+            raise SnapshotError(
+                f"包 {owner!r} 的元数据字段 {field_name!r} 必须是字符串"
+            )
+        meta[field_name] = raw.strip() or None
+    return meta
+
+
 def build_repository(
     raw: dict[str, list[dict]], target_environment: Mapping[str, str] | None = None
 ) -> Repository:
@@ -88,7 +133,13 @@ def build_repository(
     入参为纯字典（API 层对 Pydantic 模型 model_dump 后传入），形如::
 
         {"pkg": [{"version": "1.0",
+                  "source_url": "https://…/pkg-1.0.tar.gz",
+                  "sha256": "…",
+                  "license": "MIT",
                   "dependencies": [{"name": "dep", "specifier": ">=1.0"]}]}]}
+
+    候选版本可携带可选元数据 ``source_url`` / ``sha256`` / ``license``
+    （缺省或空白为 None），仅供 /sbom 导出，不参与求解与审计。
 
     ``target_environment`` 提供 ``python_version`` / ``sys_platform`` /
     ``platform_machine`` 三个键；每条依赖的 PEP 508 marker 在该环境下求值，
@@ -137,12 +188,12 @@ def build_repository(
                     continue
                 deps.append(Dependency(dep_name, spec_text.strip(), spec))
 
-            candidate = Candidate(version, deps)
+            candidate = Candidate(version, deps, **_parse_metadata(item, owner=owner))
             if version in bucket:
                 other = bucket[version]
-                if other.deps != deps:
+                if other.deps != deps or other.metadata != candidate.metadata:
                     raise SnapshotError(
-                        f"包 {cname!r} 的版本 {version} 出现多次且依赖声明不一致"
+                        f"包 {cname!r} 的版本 {version} 出现多次且依赖或元数据声明不一致"
                     )
                 # 完全重复则忽略
                 continue

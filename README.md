@@ -15,6 +15,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 `/dependency-paths` 在审计通过的锁定清单上**解释目标包为何出现**：按锁定
 版本与目标环境激活的依赖建图，返回从根包到目标包的全部最短包路径
 （菱形依赖保留等长路径，依赖环不重复节点、不会无限遍历）。
+`/sbom` 在审计通过的锁定清单上**导出确定性 SBOM 清单**：沿已激活依赖图
+逐包输出规范化名称、版本、PURL、依赖名称与快照元数据
+（`source_url` / `sha256` / `license`）；元数据缺失只形成 `warnings`，
+不阻断导出。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -47,6 +51,7 @@ docker compose up --build
 | 升级接口 | `POST http://localhost:8000/upgrade` |
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
+| SBOM 导出接口 | `POST http://localhost:8000/sbom` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -74,6 +79,9 @@ python3 -m venv .venv
 | `repository` | `object` | 是 | 仓库快照：`{包名: [候选版本...]}`；包名按 PEP 503 规范化匹配（大小写/`_`/`.`/`-` 等价） |
 | `repository.<pkg>[].version` | `string` | 是 | PEP 440 版本号，如 `1.2.3`、`2.0rc1` |
 | `repository.<pkg>[].dependencies` | `array` | 否 | 该版本声明的依赖：`{"name", "specifier", "marker"}` |
+| `repository.<pkg>[].source_url` | `string` | 否 | 元数据：该版本制品的下载地址；仅供 `/sbom` 导出，不影响求解与审计 |
+| `repository.<pkg>[].sha256` | `string` | 否 | 元数据：该版本制品的 SHA-256 摘要；语义同上 |
+| `repository.<pkg>[].license` | `string` | 否 | 元数据：该版本的许可证标识（如 `MIT`）；语义同上 |
 | `…dependencies[].name` | `string` | 是 | 被依赖包名（PEP 503 规范化匹配） |
 | `…dependencies[].specifier` | `string` | 否 | PEP 440 版本约束，如 `>=1.0,<2.0`；空串表示不约束 |
 | `…dependencies[].marker` | `string` | 否 | PEP 508 环境标记表达式（**不含**前导分号），如 `"sys_platform == 'linux'"`；空串表示无条件激活 |
@@ -705,6 +713,111 @@ curl -s -X POST http://localhost:8000/dependency-paths \
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不执行路径查询 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本、`target` 名称非法 |
 
+### `POST /sbom`
+
+在审计通过的锁定清单上**导出确定性 SBOM 清单**。请求体与 `/audit-lock`
+完全相同（`/resolve` 字段 + `current_lock`），无额外字段；仓库候选版本
+可携带可选元数据 `source_url` / `sha256` / `license`（见
+`/resolve` 的仓库字段表）。
+
+处理流程：
+
+1. **先按 `/audit-lock` 的同一套规则校验 `current_lock`**（含目标环境的
+   marker 激活语义）。锁无效时返回 **409**，携带与 `/audit-lock` 逐字节
+   一致、确定性排序的 `issues`，**不执行任何导出**（响应中没有
+   `packages` / `warnings` 字段）；
+2. 锁有效时，**不做任何版本选择**：沿已激活依赖图（按锁定版本展开目标
+   环境下的已激活依赖，与 `/dependency-paths` 同一张图）为锁中每个包
+   输出一行清单；
+3. 元数据取自快照中**锁定版本对应候选**携带的 `source_url` / `sha256` /
+   `license`（版本按 PEP 440 等价匹配：锁中 `1.0` 对应快照 `1.0.0`）。
+   字段缺失或为空白时输出 `null` 并产生一条 `warning`——**缺失元数据
+   只形成 warnings，不阻断导出**。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"ok"` |
+| `root` / `root_version` | 规范化根包名及其锁定版本 |
+| `packages` | SBOM 清单，**按规范化包名排序**（含根包）；每行含 `name`（规范化名）、`version`（锁中版本文本）、`purl`（`pkg:pypi/<规范化名>@<锁定版本>`）、`dependencies`（该包锁定版本已激活的直接依赖，规范化名、已排序）、`source_url` / `sha256` / `license`（缺失为 `null`） |
+| `warnings` | 元数据缺失警告，按（包名, 字段）排序；每条含 `package`、`field`（`source_url` / `sha256` / `license`）与 `message`；全部元数据齐备时为空列表 |
+
+```bash
+curl -s -X POST http://localhost:8000/sbom \
+  -H 'Content-Type: application/json' \
+  -d @examples/sbom.json
+```
+
+示例快照中 `auth-lib 0.9.0` 未携带 `sha256`：导出照常返回 200，该字段为
+`null`，并在 `warnings` 中记录一条（其余包元数据齐备）：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "root_version": "1.0.0",
+  "packages": [
+    {
+      "name": "app",
+      "version": "1.0.0",
+      "purl": "pkg:pypi/app@1.0.0",
+      "dependencies": ["auth-lib", "web-framework"],
+      "source_url": "https://example.invalid/packages/app-1.0.0.tar.gz",
+      "sha256": "3b8b…c4b3",
+      "license": "MIT"
+    },
+    {
+      "name": "auth-lib",
+      "version": "0.9.0",
+      "purl": "pkg:pypi/auth-lib@0.9.0",
+      "dependencies": ["shared-util"],
+      "source_url": "https://example.invalid/packages/auth-lib-0.9.0.tar.gz",
+      "sha256": null,
+      "license": "BSD-3-Clause"
+    },
+    {
+      "name": "shared-util",
+      "version": "1.5.0",
+      "purl": "pkg:pypi/shared-util@1.5.0",
+      "dependencies": [],
+      "source_url": "https://example.invalid/packages/shared-util-1.5.0.tar.gz",
+      "sha256": "ffee…1100",
+      "license": "MIT"
+    },
+    {
+      "name": "web-framework",
+      "version": "3.2.0",
+      "purl": "pkg:pypi/web-framework@3.2.0",
+      "dependencies": ["shared-util"],
+      "source_url": "https://example.invalid/packages/web-framework-3.2.0.tar.gz",
+      "sha256": "1a2b…f809",
+      "license": "Apache-2.0"
+    }
+  ],
+  "warnings": [
+    {
+      "package": "auth-lib",
+      "field": "sha256",
+      "message": "包 auth-lib==0.9.0 缺少元数据字段 sha256"
+    }
+  ]
+}
+```
+
+（为节省篇幅，上例 `sha256` 值做了截断；实际响应为完整 64 位摘要。）
+清单只取决于快照、目标环境与 `current_lock`：与包键、候选列表、锁键的
+输入顺序无关，同一输入逐字节一致。未激活的 marker 依赖不会出现在
+`dependencies` 中，未锁定版本的元数据也不会进入清单。
+
+`/sbom` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 锁有效，SBOM 导出完成（`warnings` 为空或非空都是 200） |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不执行导出 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本、元数据字段类型非法、同一版本重复声明且依赖或元数据不一致 |
+
 ---
 
 ## 三、解析规则说明
@@ -745,6 +858,12 @@ curl -s -X POST http://localhost:8000/dependency-paths \
     `null`）：所有环境都存在且版本一致为 `shared`，否则（版本不同或仅部分
     环境出现）为 `divergent`；任一环境无解则整体 409，`failures` 按 `id`
     排序给出各失败环境与 `/resolve` 同形的原冲突结果。
+13. **SBOM 导出（`/sbom`）**：先复用第 10 条的审计，锁无效即返回 409 且
+    不导出；锁有效时沿已激活依赖图为锁中每个包输出一行清单（规范化名、
+    锁中版本、`pkg:pypi/<名>@<版本>` PURL、已激活直接依赖名、快照中该
+    版本的 `source_url` / `sha256` / `license` 元数据）。包按规范化名
+    排序；元数据缺失或为空白时字段输出 `null` 并记入 `warnings`，不阻断
+    导出。元数据只随快照传递，不影响第 2～8 条的任何求解行为。
 
 ### 安全护栏
 
@@ -760,10 +879,11 @@ app/
   resolver.py    # 回溯求解器（候选排序 / MRV / 来源链重建）
   audit.py       # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
   paths.py       # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全）
-  repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker
+  sbom.py        # SBOM 清单导出（有效锁上按已激活依赖图逐包输出元数据与 PURL）
+  repository.py  # 快照规范化、PEP 440/503 解析、候选元数据、按环境过滤 marker
   markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths 示例）
+examples/        # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom 示例）
 tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

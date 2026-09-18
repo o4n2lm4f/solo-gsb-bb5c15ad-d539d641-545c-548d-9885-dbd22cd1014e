@@ -1,0 +1,64 @@
+{
+  "repository": {
+    "app": [
+      {
+        "version": "1.0.0",
+        "source_url": "https://example.invalid/packages/app-1.0.0.tar.gz",
+        "sha256": "3b8b2f6c1d0e4a5f9c7e2b1d8a6f4c3e0d9b8a7f6e5c4d3b2a1908f7e6d5c4b3",
+        "license": "MIT",
+        "dependencies": [
+          {"name": "web-framework", "specifier": ">=2.0"},
+          {"name": "auth-lib", "specifier": ""}
+        ]
+      }
+    ],
+    "web-framework": [
+      {
+        "version": "3.2.0",
+        "source_url": "https://example.invalid/packages/web-framework-3.2.0.tar.gz",
+        "sha256": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+        "license": "Apache-2.0",
+        "dependencies": [{"name": "shared-util", "specifier": ">=1.0,<3.0"}]
+      },
+      {
+        "version": "2.4.0",
+        "source_url": "https://example.invalid/packages/web-framework-2.4.0.tar.gz",
+        "sha256": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        "license": "Apache-2.0",
+        "dependencies": [{"name": "shared-util", "specifier": ">=1.0,<2.0"}]
+      }
+    ],
+    "auth-lib": [
+      {
+        "version": "0.9.0",
+        "source_url": "https://example.invalid/packages/auth-lib-0.9.0.tar.gz",
+        "license": "BSD-3-Clause",
+        "dependencies": [{"name": "shared-util", "specifier": "<2.0"}]
+      }
+    ],
+    "shared-util": [
+      {"version": "2.0.0"},
+      {
+        "version": "1.5.0",
+        "source_url": "https://example.invalid/packages/shared-util-1.5.0.tar.gz",
+        "sha256": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+        "license": "MIT"
+      },
+      {"version": "1.4.0"}
+    ]
+  },
+  "root": "app",
+  "specifier": "",
+  "allow_prereleases": false,
+  "target_environment": {
+    "python_version": "3.11",
+    "sys_platform": "linux",
+    "platform_machine": "x86_64"
+  },
+  "current_lock": {
+    "app": "1.0.0",
+    "auth-lib": "0.9.0",
+    "shared-util": "1.5.0",
+    "web-framework": "3.2.0"
+  }
+}
