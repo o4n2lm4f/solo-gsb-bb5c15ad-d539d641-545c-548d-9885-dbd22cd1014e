@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from packaging.requirements import InvalidRequirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -31,6 +34,71 @@ class SnapshotError(ValueError):
     """快照或请求中存在非法（无法按 PEP 440/503 解析的）数据。"""
 
 
+# SHA-256 摘要：恰好 64 个十六进制字符（大小写接受，内部统一为小写）。
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+@dataclass(frozen=True)
+class CandidateMetadata:
+    """候选版本随快照携带的 SBOM 元数据（全部可选，缺失项为 None）。"""
+
+    source_url: str | None = None
+    sha256: str | None = None
+    license: str | None = None
+
+    def any_missing(self) -> tuple[str, ...]:
+        """缺失（值为 None）的元数据字段名，按固定枚举次序返回。"""
+        return tuple(
+            field_name
+            for field_name, value in (
+                ("license", self.license),
+                ("sha256", self.sha256),
+                ("source_url", self.source_url),
+            )
+            if value is None
+        )
+
+
+def _parse_candidate_metadata(
+    item: Mapping, *, owner: str
+) -> CandidateMetadata:
+    """解析并校验候选版本的 source_url / sha256 / license 元数据。
+
+    三项全部可选：字段缺失或为空字符串视为“未提供”（不阻断 SBOM 导出，
+    只形成 warnings）；但一旦提供非空值就必须合法——sha256 须为 64 位
+    十六进制，source_url 须为 http/https 绝对 URL，非法值抛 SnapshotError
+    （API 层映射为 422）。
+    """
+    raw_meta = item.get("metadata")
+    if raw_meta is None:
+        return CandidateMetadata()
+
+    source_url = (raw_meta.get("source_url") or "").strip() or None
+    license_text = (raw_meta.get("license") or "").strip() or None
+    sha256_text = (raw_meta.get("sha256") or "").strip()
+
+    if source_url is not None:
+        parts = urlsplit(source_url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            raise SnapshotError(
+                f"包 {owner!r} 的元数据 source_url {source_url!r} 不是合法的"
+                " http/https 绝对 URL"
+            )
+
+    sha256_value: str | None = None
+    if sha256_text:
+        if not _SHA256_RE.match(sha256_text):
+            raise SnapshotError(
+                f"包 {owner!r} 的元数据 sha256 {raw_meta.get('sha256')!r}"
+                " 不是合法的 SHA-256 摘要（应为 64 位十六进制字符）"
+            )
+        sha256_value = sha256_text.lower()
+
+    return CandidateMetadata(
+        source_url=source_url, sha256=sha256_value, license=license_text
+    )
+
+
 class Dependency:
     __slots__ = ("name", "raw_spec", "spec")
 
@@ -52,11 +120,17 @@ class Dependency:
 
 
 class Candidate:
-    __slots__ = ("version", "deps")
+    __slots__ = ("version", "deps", "metadata")
 
-    def __init__(self, version: Version, deps: list[Dependency]):
+    def __init__(
+        self,
+        version: Version,
+        deps: list[Dependency],
+        metadata: CandidateMetadata | None = None,
+    ):
         self.version = version
         self.deps = deps
+        self.metadata = metadata or CandidateMetadata()
 
 
 class Repository:
@@ -88,7 +162,14 @@ def build_repository(
     入参为纯字典（API 层对 Pydantic 模型 model_dump 后传入），形如::
 
         {"pkg": [{"version": "1.0",
-                  "dependencies": [{"name": "dep", "specifier": ">=1.0"]}]}]}
+                  "dependencies": [{"name": "dep", "specifier": ">=1.0"}],
+                  "metadata": {"source_url": "https://...",
+                               "sha256": "<64 位十六进制>",
+                               "license": "MIT"}}]}
+
+    候选可随版本携带可选的 ``metadata``（source_url / sha256 / license），
+    供 POST /sbom 导出；三项均可缺省，但非空值必须合法（否则抛
+    SnapshotError）。marker 等其余规则见下。
 
     ``target_environment`` 提供 ``python_version`` / ``sys_platform`` /
     ``platform_machine`` 三个键；每条依赖的 PEP 508 marker 在该环境下求值，
@@ -118,6 +199,7 @@ def build_repository(
 
             deps: list[Dependency] = []
             owner = f"{cname}=={version}"
+            metadata = _parse_candidate_metadata(item, owner=owner)
             for dep in item.get("dependencies", []):
                 dep_name = dep["name"]
                 spec_text = dep.get("specifier", "")
@@ -137,12 +219,12 @@ def build_repository(
                     continue
                 deps.append(Dependency(dep_name, spec_text.strip(), spec))
 
-            candidate = Candidate(version, deps)
+            candidate = Candidate(version, deps, metadata)
             if version in bucket:
                 other = bucket[version]
-                if other.deps != deps:
+                if other.deps != deps or other.metadata != metadata:
                     raise SnapshotError(
-                        f"包 {cname!r} 的版本 {version} 出现多次且依赖声明不一致"
+                        f"包 {cname!r} 的版本 {version} 出现多次且依赖声明或元数据不一致"
                     )
                 # 完全重复则忽略
                 continue

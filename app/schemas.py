@@ -61,6 +61,29 @@ class TargetEnvironmentIn(BaseModel):
     )
 
 
+class CandidateMetadataIn(BaseModel):
+    """候选版本随快照携带的 SBOM 元数据；三项全部可选。
+
+    字段缺失或为空字符串表示“未提供”（/sbom 导出时只形成 warnings，
+    不阻断）；提供非空值时由 repository 层做格式校验（非法返回 422）。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    source_url: str | None = Field(
+        None,
+        description="该版本源码/分发包的 http(s) URL；未提供时为 null。",
+    )
+    sha256: str | None = Field(
+        None,
+        description="该版本分发包的 SHA-256 摘要（64 位十六进制字符）；未提供时为 null。",
+    )
+    license: str | None = Field(
+        None,
+        description="该版本声明的许可证（SPDX 标识或许可证文本）；未提供时为 null。",
+    )
+
+
 class CandidateIn(BaseModel):
     """仓库快照中的一个候选版本。"""
 
@@ -70,6 +93,13 @@ class CandidateIn(BaseModel):
     dependencies: list[DependencyIn] = Field(
         default_factory=list,
         description="该版本声明的依赖（输出会做确定性排序，与声明顺序无关）。",
+    )
+    metadata: CandidateMetadataIn | None = Field(
+        None,
+        description=(
+            "该版本的可选 SBOM 元数据（source_url / sha256 / license）；"
+            "仅 POST /sbom 使用，缺字段不阻断其他端点。"
+        ),
     )
 
 
@@ -203,6 +233,17 @@ class DependencyPathsRequest(AuditLockRequest):
         pattern=NAME_PATTERN,
         description="要解释的目标包名（PEP 503 规范化匹配）；不可达时返回 reachable=false。",
     )
+
+
+class SbomRequest(AuditLockRequest):
+    """POST /sbom 的请求体：沿用 /audit-lock 全部字段（/resolve 字段 + current_lock）。
+
+    先按 /audit-lock 的同一套规则校验 current_lock；锁有效时沿已激活
+    依赖图导出确定性 JSON 清单。候选版本可携带的 source_url / sha256 /
+    license 元数据定义在 repository 的候选条目上。
+    """
+
+    model_config = {"extra": "forbid"}
 
 
 # --------------------------------------------------------------------- #
@@ -502,5 +543,84 @@ class InvalidLockResponse(BaseModel):
             "与 /audit-lock 完全一致的审计问题，确定性排序：先按类型"
             "（missing、unavailable、constraint_mismatch、extraneous），"
             "再按规范化包名。"
+        ),
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /sbom 响应
+# --------------------------------------------------------------------- #
+class PackageMetadataOut(BaseModel):
+    """候选版本随快照携带的元数据；未提供的字段为 null（只产生 warning）。"""
+
+    model_config = {"extra": "forbid"}
+
+    source_url: str | None = Field(
+        ..., description="源码/分发包 URL；快照未提供时为 null。"
+    )
+    sha256: str | None = Field(
+        ..., description="SHA-256 摘要（64 位十六进制，小写）；未提供时为 null。"
+    )
+    license: str | None = Field(
+        ..., description="许可证标识/文本；未提供时为 null。"
+    )
+
+
+class SbomPackageOut(BaseModel):
+    """SBOM 中的一个包（锁定版本）。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    version: str = Field(..., description="锁定版本（PEP 440 字符串）。")
+    purl: str = Field(
+        ...,
+        description="Package URL：pkg:pypi/<规范化名>@<版本>（版本做最小百分号编码）。",
+    )
+    dependencies: list[str] = Field(
+        ...,
+        description=(
+            "该包锁定版本声明的已激活依赖的规范化名称（去重、按名称排序）；"
+            "未激活 marker 依赖不出现。"
+        ),
+    )
+    metadata: PackageMetadataOut = Field(
+        ..., description="候选版本随快照携带的元数据；缺失字段为 null。"
+    )
+
+
+class SbomWarningOut(BaseModel):
+    """一条元数据缺失提示：缺失字段不阻断导出。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    missing: list[Literal["license", "sha256", "source_url"]] = Field(
+        ...,
+        description=(
+            "该包锁定版本未提供的元数据字段名，按固定枚举次序排列；"
+            "无缺失字段的包不产生 warning。"
+        ),
+    )
+
+
+class SbomResponse(BaseModel):
+    """锁有效时的 SBOM 导出结果。"""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    packages: list[SbomPackageOut] = Field(
+        ...,
+        description=(
+            "沿已激活依赖图导出的全部包（含根包），按规范化包名排序。"
+        ),
+    )
+    warnings: list[SbomWarningOut] = Field(
+        ...,
+        description=(
+            "元数据缺失提示，按包名排序；仅列出至少缺一个元数据字段的包，"
+            "不阻断导出。"
         ),
     )

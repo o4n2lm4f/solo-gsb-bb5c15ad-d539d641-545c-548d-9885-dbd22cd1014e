@@ -15,6 +15,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 `/dependency-paths` 在审计通过的锁定清单上**解释目标包为何出现**：按锁定
 版本与目标环境激活的依赖建图，返回从根包到目标包的全部最短包路径
 （菱形依赖保留等长路径，依赖环不重复节点、不会无限遍历）。
+`/sbom` 同样**先审计 `current_lock`**，锁有效时沿已激活依赖图导出
+**确定性 JSON 物料清单（SBOM）**：每个包给出规范化名称、版本、PURL
+（Package URL）、依赖名称及候选版本随快照携带的 `source_url` / `sha256`
+/ `license` 元数据；元数据缺失只形成 `warnings`，不阻断导出。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -47,6 +51,7 @@ docker compose up --build
 | 升级接口 | `POST http://localhost:8000/upgrade` |
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
+| SBOM 导出接口 | `POST http://localhost:8000/sbom` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -74,6 +79,10 @@ python3 -m venv .venv
 | `repository` | `object` | 是 | 仓库快照：`{包名: [候选版本...]}`；包名按 PEP 503 规范化匹配（大小写/`_`/`.`/`-` 等价） |
 | `repository.<pkg>[].version` | `string` | 是 | PEP 440 版本号，如 `1.2.3`、`2.0rc1` |
 | `repository.<pkg>[].dependencies` | `array` | 否 | 该版本声明的依赖：`{"name", "specifier", "marker"}` |
+| `repository.<pkg>[].metadata` | `object` | 否 | 该版本的可选 SBOM 元数据（仅 `/sbom` 使用）：`{"source_url", "sha256", "license"}`，三项均可缺省 |
+| `…metadata[].source_url` | `string` | 否 | 该版本源码/分发包的绝对 URL（仅接受 `http`/`https`）；空串/缺省视为未提供 |
+| `…metadata[].sha256` | `string` | 否 | 该版本分发包的 SHA-256 摘要（64 位十六进制字符，大小写接受、输出统一小写）；空串/缺省视为未提供 |
+| `…metadata[].license` | `string` | 否 | 许可证标识（SPDX）或许可证文本；空串/缺省视为未提供 |
 | `…dependencies[].name` | `string` | 是 | 被依赖包名（PEP 503 规范化匹配） |
 | `…dependencies[].specifier` | `string` | 否 | PEP 440 版本约束，如 `>=1.0,<2.0`；空串表示不约束 |
 | `…dependencies[].marker` | `string` | 否 | PEP 508 环境标记表达式（**不含**前导分号），如 `"sys_platform == 'linux'"`；空串表示无条件激活 |
@@ -705,6 +714,127 @@ curl -s -X POST http://localhost:8000/dependency-paths \
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不执行路径查询 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本、`target` 名称非法 |
 
+### `POST /sbom`
+
+在**审计通过的锁定清单**上导出确定性 JSON 物料清单（SBOM）。请求体沿用
+`/audit-lock` 的全部字段（`/resolve` 字段 + `current_lock`，语义完全
+一致），无额外字段；候选版本可携带的 `source_url` / `sha256` /
+`license` 元数据定义在 `repository` 的候选条目上（见上文 `/resolve`
+字段表）。
+
+处理流程：
+
+1. **先按 `/audit-lock` 的同一套规则校验 `current_lock`**（含目标环境的
+   marker 激活语义）。锁无效时返回 **409**，携带与 `/audit-lock`
+   逐字节一致、确定性排序的 `issues`，**不导出任何清单**（响应中没有
+   `packages` / `warnings` 字段）；
+2. 锁有效时**不做任何版本选择**：按每个包的**锁定版本**沿目标环境下的
+   **已激活依赖图**展开（与 `/dependency-paths` 同一张图；未激活 marker
+   依赖既不是图的边，也不是导出的包）；
+3. 逐包导出清单条目；**元数据缺失不阻断导出**——只在顶层 `warnings`
+   中逐项提示。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"ok"` |
+| `root` | 规范化（PEP 503）后的根包名 |
+| `packages` | 已激活依赖图中的全部包（**含根包**），**按规范化包名排序** |
+| `packages[].name` | PEP 503 规范化包名 |
+| `packages[].version` | 锁定版本（PEP 440 字符串） |
+| `packages[].purl` | [Package URL](https://github.com/package-url/purl-spec)：`pkg:pypi/<规范化名>@<版本>`；版本按 PURL 规则做确定性最小百分号编码（PEP 440 的 `1.0`、`2.0rc1`、`1!2.0` 等均原样输出） |
+| `packages[].dependencies` | 该包锁定版本声明的**已激活**依赖的规范化名称：同一依赖的多条声明去重、按名称排序；未激活 marker 依赖不出现；无依赖时为 `[]` |
+| `packages[].metadata` | 候选版本携带的元数据：`source_url` / `sha256` / `license`；快照未提供的字段为 `null`（sha256 输出统一小写） |
+| `warnings` | 元数据缺失提示，**按包名排序**；仅列出至少缺一个字段的包。每条为 `{"name", "missing"}`，`missing` 是缺失字段名列表，按固定枚举次序 `license` → `sha256` → `source_url` 排列；元数据完整时 `warnings` 为 `[]` |
+
+```bash
+curl -s -X POST http://localhost:8000/sbom \
+  -H 'Content-Type: application/json' \
+  -d @examples/sbom.json
+```
+
+示例中四个包均锁定且元数据完整度不一：`app` / `web-framework` 三项齐全，
+`auth-lib` 缺 `sha256`，`shared-util 1.5.0` 缺 `source_url`
+（快照中存在但未锁定的 `shared-util 2.0.0` / `web-framework 2.4.0`
+的元数据不会出现——元数据取自**锁定版本**的候选）：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "packages": [
+    {
+      "name": "app",
+      "version": "1.0.0",
+      "purl": "pkg:pypi/app@1.0.0",
+      "dependencies": ["auth-lib", "web-framework"],
+      "metadata": {
+        "source_url": "https://example.invalid/src/app-1.0.0.tar.gz",
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "license": "Apache-2.0"
+      }
+    },
+    {
+      "name": "auth-lib",
+      "version": "0.9.0",
+      "purl": "pkg:pypi/auth-lib@0.9.0",
+      "dependencies": ["shared-util"],
+      "metadata": {
+        "source_url": "https://example.invalid/src/auth-lib-0.9.0.tar.gz",
+        "sha256": null,
+        "license": "MIT"
+      }
+    },
+    {
+      "name": "shared-util",
+      "version": "1.5.0",
+      "purl": "pkg:pypi/shared-util@1.5.0",
+      "dependencies": [],
+      "metadata": {
+        "source_url": null,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "license": "MIT"
+      }
+    },
+    {
+      "name": "web-framework",
+      "version": "3.2.0",
+      "purl": "pkg:pypi/web-framework@3.2.0",
+      "dependencies": ["shared-util"],
+      "metadata": {
+        "source_url": "https://example.invalid/src/web-framework-3.2.0.tar.gz",
+        "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        "license": "BSD-3-Clause"
+      }
+    }
+  ],
+  "warnings": [
+    {"name": "auth-lib", "missing": ["sha256"]},
+    {"name": "shared-util", "missing": ["source_url"]}
+  ]
+}
+```
+
+遍历与确定性细节：
+
+- 元数据**只读取锁定版本的候选**：同一包未被锁定的其他版本携带的元数据
+  不会导出，也不会与锁定版本合并。
+- 同一包名（PEP 503）同一版本在快照中出现多次时，依赖声明与元数据都必须
+  完全一致，否则返回 422；完全重复则合并为一条候选。
+- `dependencies` 与 `packages` 都按规范化名排序，`warnings` 按包名排序；
+  重复请求同一快照、锁与环境，输出逐字节一致。
+- 未激活 marker 依赖不参与：换一个 `target_environment`，已激活图变化，
+  导出的包与依赖名随之变化（在新环境下若锁审计失败则返回 409）。
+
+`/sbom` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 锁有效，SBOM 导出完成（即使存在元数据 `warnings` 仍是 200） |
+| `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不导出清单 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本、候选 `metadata.sha256` 不是 64 位十六进制、`metadata.source_url` 不是 `http`/`https` 绝对 URL |
+
 ---
 
 ## 三、解析规则说明
@@ -745,6 +875,12 @@ curl -s -X POST http://localhost:8000/dependency-paths \
     `null`）：所有环境都存在且版本一致为 `shared`，否则（版本不同或仅部分
     环境出现）为 `divergent`；任一环境无解则整体 409，`failures` 按 `id`
     排序给出各失败环境与 `/resolve` 同形的原冲突结果。
+13. **物料清单（`/sbom`）**：先复用第 10 条的审计，锁无效即返回 409 且不
+    导出；锁有效时沿第 11 条的已激活依赖图（按锁定版本、无版本选择）逐包
+    导出规范化名称、版本、PURL（`pkg:pypi/<name>@<version>`）、已激活
+    依赖名称（去重排序）与候选版本携带的 `source_url` / `sha256` /
+    `license` 元数据；元数据缺失不阻断导出，只在 `warnings` 中按包名逐项
+    提示；`packages` 按包名排序，输出只取决于快照、环境与锁。
 
 ### 安全护栏
 
@@ -760,10 +896,11 @@ app/
   resolver.py    # 回溯求解器（候选排序 / MRV / 来源链重建）
   audit.py       # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
   paths.py       # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全）
-  repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker
+  sbom.py        # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
+  repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
   markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths 示例）
+examples/        # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom 示例）
 tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml
